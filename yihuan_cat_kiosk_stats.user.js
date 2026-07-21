@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         异环午夜猫刊亭统计
 // @namespace    https://kf.wanmei.com/
-// @version      1.1.3
+// @version      1.1.4
 // @description  在物品流向查询页分别查询活动累计或过去 24 小时的消费、收入、盈亏和回报率
 // @match        https://kf.wanmei.com/selfItemFlowQuery*
 // @license      GPL-3.0-only
@@ -19,6 +19,7 @@
   const EVENT_START = new Date("2026-07-02T00:00:00+08:00");
   const DAY = 24 * 60 * 60 * 1000;
   const MAX_SLICE = 7 * DAY;
+  const END_TIME_GRACE = 5 * 1000;
   const SERVER_OFFSET = 8 * 60 * 60 * 1000;
   const ACTIONS_ID = "yihuan-cat-kiosk-stats-actions";
   const DIALOG_ID = "yihuan-cat-kiosk-stats-dialog";
@@ -254,13 +255,15 @@
       running = true;
       buttons.forEach((item) => { item.disabled = true; });
       try {
-        const now = new Date(Math.floor(Date.now() / 1000) * 1000);
-        const periodStart = start(now);
+        const periodEnd = new Date(
+          Math.floor(Date.now() / 1000) * 1000 - END_TIME_GRACE,
+        );
+        const periodStart = start(periodEnd);
         button.textContent = "查询中 1/1";
         const value = useNativeQuery
-          ? metrics(await queryLast24HoursNative(periodStart, now))
-          : await runQuery(button, periodStart, now);
-        const generatedAt = formatDate(now);
+          ? metrics(await queryLast24HoursNative(periodStart, periodEnd))
+          : await runQuery(button, periodStart, periodEnd);
+        const generatedAt = formatDate(periodEnd);
         globalThis.yihuanActivityStats = {
           ...(globalThis.yihuanActivityStats || {}),
           [key]: { generatedAt, ...value },
