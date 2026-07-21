@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         异环午夜猫刊亭统计
 // @namespace    https://kf.wanmei.com/
-// @version      1.1.2
+// @version      1.1.3
 // @description  在物品流向查询页分别查询活动累计或过去 24 小时的消费、收入、盈亏和回报率
 // @match        https://kf.wanmei.com/selfItemFlowQuery*
 // @license      GPL-3.0-only
@@ -52,6 +52,21 @@
     return { spent: Number(match[1]), income: Number(match[2]) };
   }
 
+  function parsePayload(raw) {
+    const text = typeof raw === "string"
+      ? raw.replace(/<pre[^>]*>/gi, "").replace(/<\/pre>/gi, "").trim()
+      : raw;
+    let payload;
+    try {
+      payload = typeof text === "string" ? JSON.parse(text) : text;
+    } catch {
+      throw new Error("查询返回异常，登录可能已经失效");
+    }
+    if (!payload) throw new Error("查询没有返回结果，请稍后重试");
+    if (String(payload.code) === "1") throw new Error(payload.message || "查询失败");
+    return parseInfo(payload?.data?.info);
+  }
+
   function metrics({ spent, income }) {
     return {
       spent,
@@ -99,24 +114,13 @@
     });
     if (!response.ok) throw new Error(`查询失败：HTTP ${response.status}`);
 
-    const raw = (await response.text())
-      .replace(/<pre[^>]*>/gi, "")
-      .replace(/<\/pre>/gi, "")
-      .trim();
-    let payload;
-    try {
-      payload = JSON.parse(raw);
-    } catch {
-      throw new Error("查询返回异常，登录可能已经失效");
-    }
-    if (payload?.code === 1) throw new Error(payload.message || "查询失败");
-    return parseInfo(payload?.data?.info);
+    return parsePayload(await response.text());
   }
 
   async function queryLast24HoursNative(start, end) {
     formParams(start, end);
     const $ = globalThis.jQuery;
-    if (!$?.fn?.datetimebox || !$?.fn?.combobox) {
+    if (!$?.fn?.datetimebox || !$?.fn?.combobox || !$?.fn?.ajaxSubmit) {
       throw new Error("页面查询组件尚未加载，请刷新页面后重试");
     }
 
@@ -126,29 +130,28 @@
     $("#startTime").datetimebox("setValue", formatDate(start));
     $("#endTime").datetimebox("setValue", formatDate(end));
 
-    const nativeButton = document.querySelector("#btn");
-    let sawBusy = false;
-    const startedAt = Date.now();
-    nativeButton.click();
-    await new Promise((resolve, reject) => {
-      const timer = setInterval(() => {
-        const text = nativeButton.textContent.trim();
-        if (text.includes("查询中")) sawBusy = true;
-        if (text === "查询" && (sawBusy || Date.now() - startedAt >= 500)) {
-          clearInterval(timer);
-          resolve();
-        } else if (Date.now() - startedAt >= 20000) {
-          clearInterval(timer);
-          reject(new Error("查询超时，请稍后重试"));
-        }
-      }, 100);
+    const form = $("#selfItemFlowQueryForm");
+    const data = form
+      .find(":not('input[name=item1],input[name=item2],input[name=item3],input[name=item4],input[name=item8],input[name=item11]')")
+      .serialize();
+    return new Promise((resolve, reject) => {
+      form.ajaxSubmit({
+        type: "post",
+        url: "/selfItemFlowQuery/search",
+        data,
+        timeout: 20000,
+        success(raw) {
+          try {
+            resolve(parsePayload(raw));
+          } catch (error) {
+            reject(error);
+          }
+        },
+        error(_request, status) {
+          reject(new Error(status === "timeout" ? "查询超时，请稍后重试" : "查询失败，请稍后重试"));
+        },
+      });
     });
-
-    const info = document.querySelector("#result-miaowu-kuaibao-info");
-    if (!info || getComputedStyle(info).display === "none") {
-      return { spent: 0, income: 0 };
-    }
-    return parseInfo(info.textContent.trim());
   }
 
   async function runQuery(button, start, end) {
@@ -293,9 +296,15 @@
       new Date("2026-07-02T00:00:00+08:00"),
       new Date("2026-07-22T00:00:00+08:00"),
     );
-    const parsed = parseInfo(
-      "共计消耗17420000方斯购买好感度道具，获得奖券奖励15180000方斯",
+    const parsed = parsePayload(
+      '<pre>{"code":0,"data":{"info":"共计消耗17420000方斯购买好感度道具，获得奖券奖励15180000方斯"}}</pre>',
     );
+    let rejectedError;
+    try {
+      parsePayload('{"code":"1","message":"测试错误"}');
+    } catch (error) {
+      rejectedError = error;
+    }
     if (slices.length !== 3) throw new Error("分片自检失败");
     if (slices[0].end.getTime() + 1000 !== slices[1].start.getTime()) {
       throw new Error("分片边界自检失败");
@@ -303,6 +312,7 @@
     if (parsed.spent !== 17420000 || metrics(parsed).profit !== -2240000) {
       throw new Error("汇总自检失败");
     }
+    if (rejectedError?.message !== "测试错误") throw new Error("错误响应自检失败");
     if (formatDate(new Date("2026-07-21T16:49:00Z")) !== "2026-07-22 00:49:00") {
       throw new Error("时间格式自检失败");
     }
