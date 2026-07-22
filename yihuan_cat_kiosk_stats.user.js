@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         异环午夜猫刊亭统计
 // @namespace    https://kf.wanmei.com/
-// @version      1.1.4
-// @description  在物品流向查询页分别查询活动累计或过去 24 小时的消费、收入、盈亏和回报率
+// @version      1.2.0
+// @description  在物品流向查询页分别查询活动累计或今日的消费、收入、盈亏和回报率
 // @match        https://kf.wanmei.com/selfItemFlowQuery*
 // @license      GPL-3.0-only
 // @homepageURL  https://github.com/laipz8200/yihuan-cat-kiosk-stats
@@ -29,6 +29,14 @@
       .toISOString()
       .slice(0, 19)
       .replace("T", " ");
+  }
+
+  function gameDayStart(now) {
+    const serverNow = new Date(now.getTime() + SERVER_OFFSET);
+    const start = new Date(serverNow);
+    start.setUTCHours(4, 0, 0, 0);
+    if (start >= serverNow) start.setUTCDate(start.getUTCDate() - 1);
+    return new Date(start.getTime() - SERVER_OFFSET);
   }
 
   function splitRange(start, end) {
@@ -118,7 +126,7 @@
     return parsePayload(await response.text());
   }
 
-  async function queryLast24HoursNative(start, end) {
+  async function queryPageRange(start, end) {
     formParams(start, end);
     const $ = globalThis.jQuery;
     if (!$?.fn?.datetimebox || !$?.fn?.combobox || !$?.fn?.ajaxSubmit) {
@@ -229,10 +237,10 @@
     const activityButton = document.createElement("button");
     activityButton.type = "button";
     activityButton.textContent = "查询活动累计";
-    const last24HoursButton = document.createElement("button");
-    last24HoursButton.type = "button";
-    last24HoursButton.textContent = "查询过去 24 小时";
-    actions.append(activityButton, last24HoursButton);
+    const todayButton = document.createElement("button");
+    todayButton.type = "button";
+    todayButton.textContent = "查询今日";
+    actions.append(activityButton, todayButton);
 
     const dialog = document.createElement("dialog");
     dialog.id = DIALOG_ID;
@@ -248,7 +256,7 @@
     `;
     dialog.querySelector("[data-close]").addEventListener("click", () => dialog.close());
 
-    const buttons = [activityButton, last24HoursButton];
+    const buttons = [activityButton, todayButton];
     let running = false;
     async function execute(button, label, start, key, useNativeQuery = false) {
       if (running) return;
@@ -261,7 +269,7 @@
         const periodStart = start(periodEnd);
         button.textContent = "查询中 1/1";
         const value = useNativeQuery
-          ? metrics(await queryLast24HoursNative(periodStart, periodEnd))
+          ? metrics(await queryPageRange(periodStart, periodEnd))
           : await runQuery(button, periodStart, periodEnd);
         const generatedAt = formatDate(periodEnd);
         globalThis.yihuanActivityStats = {
@@ -275,17 +283,17 @@
         running = false;
         buttons.forEach((item) => { item.disabled = false; });
         activityButton.textContent = "查询活动累计";
-        last24HoursButton.textContent = "查询过去 24 小时";
+        todayButton.textContent = "查询今日";
       }
     }
     activityButton.addEventListener("click", () =>
       execute(activityButton, "活动开始至今", () => EVENT_START, "activityToDate"));
-    last24HoursButton.addEventListener("click", () =>
+    todayButton.addEventListener("click", () =>
       execute(
-        last24HoursButton,
-        "过去24小时",
-        (now) => new Date(now.getTime() - DAY),
-        "last24Hours",
+        todayButton,
+        "今日",
+        gameDayStart,
+        "today",
         true,
       ));
 
@@ -316,6 +324,12 @@
       throw new Error("汇总自检失败");
     }
     if (rejectedError?.message !== "测试错误") throw new Error("错误响应自检失败");
+    if (
+      formatDate(gameDayStart(new Date("2026-07-22T03:59:59+08:00"))) !== "2026-07-21 04:00:00"
+      || formatDate(gameDayStart(new Date("2026-07-22T04:00:01+08:00"))) !== "2026-07-22 04:00:00"
+    ) {
+      throw new Error("今日起点自检失败");
+    }
     if (formatDate(new Date("2026-07-21T16:49:00Z")) !== "2026-07-22 00:49:00") {
       throw new Error("时间格式自检失败");
     }
