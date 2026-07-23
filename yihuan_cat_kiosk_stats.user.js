@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         异环午夜猫刊亭统计
 // @namespace    https://kf.wanmei.com/
-// @version      1.2.0
+// @version      1.2.1
 // @description  在物品流向查询页分别查询活动累计或今日的消费、收入、盈亏和回报率
 // @match        https://kf.wanmei.com/selfItemFlowQuery*
 // @license      GPL-3.0-only
@@ -73,6 +73,9 @@
     }
     if (!payload) throw new Error("查询没有返回结果，请稍后重试");
     if (String(payload.code) === "1") throw new Error(payload.message || "查询失败");
+    if (Array.isArray(payload?.data?.result) && payload.data.result.length === 0) {
+      return { spent: 0, income: 0 };
+    }
     return parseInfo(payload?.data?.info);
   }
 
@@ -310,6 +313,9 @@
     const parsed = parsePayload(
       '<pre>{"code":0,"data":{"info":"共计消耗17420000方斯购买好感度道具，获得奖券奖励15180000方斯"}}</pre>',
     );
+    const empty = parsePayload(
+      '{"code":0,"data":{"result":[],"info":"暂时没有搜索到对应的信息"}}',
+    );
     let rejectedError;
     try {
       parsePayload('{"code":"1","message":"测试错误"}');
@@ -323,6 +329,7 @@
     if (parsed.spent !== 17420000 || metrics(parsed).profit !== -2240000) {
       throw new Error("汇总自检失败");
     }
+    if (empty.spent !== 0 || empty.income !== 0) throw new Error("空区间自检失败");
     if (rejectedError?.message !== "测试错误") throw new Error("错误响应自检失败");
     if (
       formatDate(gameDayStart(new Date("2026-07-22T03:59:59+08:00"))) !== "2026-07-21 04:00:00"
