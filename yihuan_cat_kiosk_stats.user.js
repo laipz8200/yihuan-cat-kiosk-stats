@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         异环午夜猫刊亭统计
 // @namespace    https://kf.wanmei.com/
-// @version      1.3.0
+// @version      1.3.1
 // @description  在物品流向查询页分别查询活动累计或今日的消费、收入、盈亏和回报率
 // @match        https://kf.wanmei.com/selfItemFlowQuery*
 // @license      GPL-3.0-only
@@ -17,10 +17,21 @@
   "use strict";
 
   const EVENT_START = new Date("2026-07-02T00:00:00+08:00");
+  const DAY = 24 * 60 * 60 * 1000;
+  const MAX_SLICE = 7 * DAY;
+  const PAGE_SIZE = 1000;
   const END_TIME_GRACE = 5 * 1000;
   const SERVER_OFFSET = 8 * 60 * 60 * 1000;
   const ACTIONS_ID = "yihuan-cat-kiosk-stats-actions";
   const DIALOG_ID = "yihuan-cat-kiosk-stats-dialog";
+  // 查询明细不含单次消费额，按游戏内当前售价换算；汇总后会与接口总额校验。
+  const CARD_PRICES = new Map([
+    ["《荧幕之外》", 10000],
+    ["《海特洛快讯》", 20000],
+    ["《猫会梦见什么》", 50000],
+    ["《拉面的艺术》", 50000],
+    ["《在书本之外》", 50000],
+  ]);
 
   function formatDate(date) {
     return new Date(date.getTime() + SERVER_OFFSET)
@@ -43,10 +54,8 @@
     const slices = [];
     let cursor = new Date(start);
     while (cursor <= end) {
-      const nextDay = new Date(cursor.getTime() + SERVER_OFFSET);
-      nextDay.setUTCHours(24, 0, 0, 0);
       const sliceEnd = new Date(
-        Math.min(end.getTime(), nextDay.getTime() - SERVER_OFFSET - 1000),
+        Math.min(end.getTime(), cursor.getTime() + MAX_SLICE - 1000),
       );
       slices.push({ start: cursor, end: sliceEnd });
       cursor = new Date(sliceEnd.getTime() + 1000);
@@ -73,10 +82,17 @@
     }
     if (!payload) throw new Error("查询没有返回结果，请稍后重试");
     if (String(payload.code) === "1") throw new Error(payload.message || "查询失败");
-    if (Array.isArray(payload?.data?.result) && payload.data.result.length === 0) {
-      return { spent: 0, income: 0, hasRecords: false };
+    const records = payload?.data?.result;
+    if (!Array.isArray(records)) throw new Error("查询返回缺少活动明细");
+    const total = Number(payload.data.total ?? records.length);
+    if (!Number.isInteger(total) || total < records.length) {
+      throw new Error("查询返回的记录总数异常");
     }
-    return { ...parseInfo(payload?.data?.info), hasRecords: true };
+    if (records.length === 0) {
+      if (total !== 0) throw new Error("查询明细分页不完整");
+      return { spent: 0, income: 0, records, total };
+    }
+    return { ...parseInfo(payload.data.info), records, total };
   }
 
   function metrics({ spent, income }) {
@@ -88,12 +104,47 @@
     };
   }
 
-  function trimLeadingEmptyDays(days) {
-    const first = days.findIndex((day) => day.hasRecords);
-    return first < 0 ? [] : days.slice(first);
+  function aggregateRecords(records, end) {
+    const totals = { spent: 0, income: 0 };
+    const byDay = new Map();
+    for (const record of records) {
+      const date = String(record?.logTime ?? "").slice(0, 10);
+      const card = String(record?.scratchCardId ?? "").trim();
+      const award = String(record?.award ?? "").trim();
+      const incomeMatch = award.match(/^方斯\*(\d+)$/);
+      const spent = CARD_PRICES.get(card);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+        throw new Error(`无法识别记录时间：${record?.logTime ?? ""}`);
+      }
+      if (spent === undefined) throw new Error(`无法识别好感度道具：${card}`);
+      if (award && !incomeMatch) throw new Error(`无法识别奖励：${award}`);
+
+      const income = incomeMatch ? Number(incomeMatch[1]) : 0;
+      const day = byDay.get(date) || { spent: 0, income: 0 };
+      day.spent += spent;
+      day.income += income;
+      byDay.set(date, day);
+      totals.spent += spent;
+      totals.income += income;
+    }
+
+    if (byDay.size === 0) return { ...totals, daily: [] };
+    const first = [...byDay.keys()].sort()[0];
+    const last = formatDate(end).slice(0, 10);
+    const lastDate = new Date(`${last}T00:00:00Z`);
+    const daily = [];
+    for (
+      let cursor = new Date(`${first}T00:00:00Z`);
+      cursor <= lastDate;
+      cursor = new Date(cursor.getTime() + DAY)
+    ) {
+      const date = cursor.toISOString().slice(0, 10);
+      daily.push({ date, profit: metrics(byDay.get(date) || { spent: 0, income: 0 }).profit });
+    }
+    return { ...totals, daily };
   }
 
-  function formParams(start, end) {
+  function formParams(start, end, pageNo = 1) {
     const form = document.querySelector("#selfItemFlowQueryForm");
     if (!form) throw new Error("请先登录并进入异环物品流向自助查询页面");
     if (!document.querySelector("#prolink")?.checked) {
@@ -113,80 +164,58 @@
     params.set("item", "");
     params.set("startTime", formatDate(start));
     params.set("endTime", formatDate(end));
-    params.set("pageNo", "1");
-    params.set("pageSize", "1000");
+    params.set("pageNo", String(pageNo));
+    params.set("pageSize", String(PAGE_SIZE));
     return params;
   }
 
   async function querySlice(start, end) {
-    const response = await fetch("/selfItemFlowQuery/search", {
-      method: "POST",
-      credentials: "same-origin",
-      cache: "no-store",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-      },
-      body: formParams(start, end).toString(),
-    });
-    if (!response.ok) throw new Error(`查询失败：HTTP ${response.status}`);
-
-    return parsePayload(await response.text());
-  }
-
-  async function queryPageRange(start, end) {
-    formParams(start, end);
-    const $ = globalThis.jQuery;
-    if (!$?.fn?.datetimebox || !$?.fn?.combobox || !$?.fn?.ajaxSubmit) {
-      throw new Error("页面查询组件尚未加载，请刷新页面后重试");
-    }
-
-    if (String($("#itemType").combobox("getValue")) !== "13") {
-      $("#itemType").combobox("select", "13");
-    }
-    $("#startTime").datetimebox("setValue", formatDate(start));
-    $("#endTime").datetimebox("setValue", formatDate(end));
-
-    const form = $("#selfItemFlowQueryForm");
-    const data = form
-      .find(":not('input[name=item1],input[name=item2],input[name=item3],input[name=item4],input[name=item8],input[name=item11]')")
-      .serialize();
-    return new Promise((resolve, reject) => {
-      form.ajaxSubmit({
-        type: "post",
-        url: "/selfItemFlowQuery/search",
-        data,
-        timeout: 20000,
-        success(raw) {
-          try {
-            resolve(parsePayload(raw));
-          } catch (error) {
-            reject(error);
-          }
+    let summary;
+    let total = 0;
+    const records = [];
+    for (let pageNo = 1; ; pageNo += 1) {
+      const response = await fetch("/selfItemFlowQuery/search", {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+          "X-Requested-With": "XMLHttpRequest",
         },
-        error(_request, status) {
-          reject(new Error(status === "timeout" ? "查询超时，请稍后重试" : "查询失败，请稍后重试"));
-        },
+        body: formParams(start, end, pageNo).toString(),
       });
-    });
+      if (!response.ok) throw new Error(`查询失败：HTTP ${response.status}`);
+
+      const page = parsePayload(await response.text());
+      if (!summary) {
+        summary = { spent: page.spent, income: page.income };
+        total = page.total;
+      }
+      records.push(...page.records);
+      if (records.length > total) throw new Error("查询明细分页异常");
+      if (records.length === total) break;
+      if (page.records.length === 0) throw new Error("查询明细分页不完整");
+    }
+    return { ...summary, records, total };
   }
 
-  async function runQuery(button, start, end, query) {
+  async function runQuery(button, start, end) {
     const slices = splitRange(start, end);
     const total = { spent: 0, income: 0 };
-    const daily = [];
+    const records = [];
     for (let index = 0; index < slices.length; index += 1) {
       button.textContent = `查询中 ${index + 1}/${slices.length}`;
-      const value = await query(slices[index].start, slices[index].end);
+      const value = await querySlice(slices[index].start, slices[index].end);
+      if (value.records.length === 0) continue;
       total.spent += value.spent;
       total.income += value.income;
-      daily.push({
-        date: formatDate(slices[index].start).slice(0, 10),
-        profit: value.income - value.spent,
-        hasRecords: value.hasRecords,
-      });
+      records.push(...value.records);
     }
-    return { ...metrics(total), daily: trimLeadingEmptyDays(daily) };
+    const details = aggregateRecords(records, end);
+    if (details.spent !== total.spent || details.income !== total.income) {
+      throw new Error("查询明细与汇总不一致，活动售价或返回格式可能已调整");
+    }
+    return { ...metrics(total), daily: details.daily };
   }
 
   function addCell(row, text) {
@@ -350,7 +379,7 @@
 
     const buttons = [activityButton, todayButton];
     let running = false;
-    async function execute(button, label, start, key, query = querySlice) {
+    async function execute(button, label, start, key) {
       if (running) return;
       running = true;
       buttons.forEach((item) => { item.disabled = true; });
@@ -361,12 +390,7 @@
         const periodStart = start(periodEnd);
         button.textContent = "查询中 1/1";
         const generatedAt = formatDate(periodEnd);
-        const value = await runQuery(
-          button,
-          periodStart,
-          periodEnd,
-          query,
-        );
+        const value = await runQuery(button, periodStart, periodEnd);
         globalThis.yihuanActivityStats = {
           ...(globalThis.yihuanActivityStats || {}),
           [key]: { generatedAt, ...value },
@@ -384,13 +408,7 @@
     activityButton.addEventListener("click", () =>
       execute(activityButton, "活动开始至今", () => EVENT_START, "activityToDate"));
     todayButton.addEventListener("click", () =>
-      execute(
-        todayButton,
-        "今日",
-        gameDayStart,
-        "today",
-        queryPageRange,
-      ));
+      execute(todayButton, "今日", gameDayStart, "today"));
 
     document.head.append(style);
     queryButton.insertAdjacentElement("afterend", actions);
@@ -402,57 +420,60 @@
       new Date("2026-07-02T00:00:00+08:00"),
       new Date("2026-07-22T00:00:00+08:00"),
     );
-    const crossDaySlices = splitRange(
-      new Date("2026-07-21T04:00:00+08:00"),
-      new Date("2026-07-22T03:59:59+08:00"),
-    );
     const parsed = parsePayload(
-      '<pre>{"code":0,"data":{"info":"共计消耗17420000方斯购买好感度道具，获得奖券奖励15180000方斯"}}</pre>',
+      '<pre>{"code":0,"data":{"total":5,"result":[{"logTime":"2026-07-03 12:00","scratchCardId":"《荧幕之外》","award":"方斯*40000"},{"logTime":"2026-07-03 12:01","scratchCardId":"《拉面的艺术》","award":"方斯*50000"},{"logTime":"2026-07-03 12:02","scratchCardId":"《在书本之外》","award":"方斯*50000"},{"logTime":"2026-07-04 12:00","scratchCardId":"《猫会梦见什么》","award":"方斯*50000"},{"logTime":"2026-07-05 12:00","scratchCardId":"《海特洛快讯》","award":""}],"info":"共计消耗180000方斯购买好感度道具，获得奖券奖励190000方斯"}}</pre>',
     );
     const empty = parsePayload(
       '{"code":0,"data":{"result":[],"info":"暂时没有搜索到对应的信息"}}',
     );
     let rejectedError;
+    let incompleteError;
     try {
       parsePayload('{"code":"1","message":"测试错误"}');
     } catch (error) {
       rejectedError = error;
     }
-    const daily = trimLeadingEmptyDays([
-      { date: "2026-07-02", profit: 0, hasRecords: false },
-      { date: "2026-07-03", profit: 30, hasRecords: true },
-      { date: "2026-07-04", profit: 0, hasRecords: false },
-      { date: "2026-07-05", profit: -20, hasRecords: true },
-      { date: "2026-07-06", profit: 0, hasRecords: false },
-    ]);
-    if (slices.length !== 21) throw new Error("分片自检失败");
+    try {
+      parsePayload('{"code":0,"data":{"total":1,"result":[]}}');
+    } catch (error) {
+      incompleteError = error;
+    }
+    const details = aggregateRecords(
+      parsed.records,
+      new Date("2026-07-05T23:59:59+08:00"),
+    );
+    if (
+      slices.length !== 3
+      || formatDate(slices[0].end) !== "2026-07-08 23:59:59"
+      || formatDate(slices[1].start) !== "2026-07-09 00:00:00"
+    ) {
+      throw new Error("分片自检失败");
+    }
     if (slices[0].end.getTime() + 1000 !== slices[1].start.getTime()) {
       throw new Error("分片边界自检失败");
     }
     if (
-      parsed.spent !== 17420000
-      || metrics(parsed).profit !== -2240000
-      || !parsed.hasRecords
+      parsed.spent !== 180000
+      || parsed.total !== 5
+      || metrics(parsed).profit !== 10000
     ) {
       throw new Error("汇总自检失败");
     }
-    if (empty.spent !== 0 || empty.income !== 0 || empty.hasRecords) {
+    if (empty.spent !== 0 || empty.income !== 0 || empty.records.length !== 0) {
       throw new Error("空区间自检失败");
     }
     if (
-      daily.map((day) => day.date).join(",") !== "2026-07-03,2026-07-04,2026-07-05,2026-07-06"
-      || daily.map((day) => day.profit).join(",") !== "30,0,-20,0"
+      details.spent !== parsed.spent
+      || details.income !== parsed.income
+      || details.daily.map((day) => day.date).join(",") !== "2026-07-03,2026-07-04,2026-07-05"
+      || details.daily.map((day) => day.profit).join(",") !== "30000,0,-20000"
     ) {
       throw new Error("每日收益自检失败");
     }
-    if (
-      crossDaySlices.length !== 2
-      || formatDate(crossDaySlices[0].end) !== "2026-07-21 23:59:59"
-      || formatDate(crossDaySlices[1].start) !== "2026-07-22 00:00:00"
-    ) {
-      throw new Error("跨日分片自检失败");
-    }
     if (rejectedError?.message !== "测试错误") throw new Error("错误响应自检失败");
+    if (incompleteError?.message !== "查询明细分页不完整") {
+      throw new Error("分页自检失败");
+    }
     if (
       formatDate(gameDayStart(new Date("2026-07-22T03:59:59+08:00"))) !== "2026-07-21 04:00:00"
       || formatDate(gameDayStart(new Date("2026-07-22T04:00:01+08:00"))) !== "2026-07-22 04:00:00"
