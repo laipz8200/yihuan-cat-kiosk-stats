@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         异环午夜猫刊亭统计
 // @namespace    https://kf.wanmei.com/
-// @version      1.3.1
+// @version      1.3.2
 // @description  在物品流向查询页分别查询活动累计或今日的消费、收入、盈亏和回报率
 // @match        https://kf.wanmei.com/selfItemFlowQuery*
 // @license      GPL-3.0-only
@@ -169,11 +169,44 @@
     return params;
   }
 
-  async function querySlice(start, end) {
-    let summary;
-    let total = 0;
-    const records = [];
-    for (let pageNo = 1; ; pageNo += 1) {
+  function prepareRange(start, end) {
+    const $ = globalThis.jQuery;
+    if (!$?.fn?.datetimebox || !$?.fn?.combobox) {
+      throw new Error("页面查询组件尚未加载，请刷新页面后重试");
+    }
+    if (String($("#itemType").combobox("getValue")) !== "13") {
+      $("#itemType").combobox("select", "13");
+    }
+    $("#startTime").datetimebox("setValue", formatDate(start));
+    $("#endTime").datetimebox("setValue", formatDate(end));
+  }
+
+  function freshCaptcha(instance, secCode, consumed) {
+    return secCode && instance !== consumed ? { instance, secCode } : null;
+  }
+
+  function captchaResult(consumed) {
+    if (typeof mCaptcha === "undefined" || typeof initCaptcha !== "function") {
+      throw new Error("页面滑动验证组件尚未加载，请刷新页面后重试");
+    }
+    return freshCaptcha(
+      mCaptcha,
+      String(mCaptcha.getValidateResult() || "").trim(),
+      consumed,
+    );
+  }
+
+  function resetCaptcha() {
+    const secCodeInput = document.querySelector("#secCode");
+    if (secCodeInput) secCodeInput.value = "";
+    try { initCaptcha(); } catch {}
+  }
+
+  async function requestPage(start, end, pageNo, secCode) {
+    try {
+      const params = formParams(start, end, pageNo);
+      if (!params.get("capTicket")) throw new Error("滑动验证尚未准备好，请稍后重试");
+      params.set("secCode", secCode);
       const response = await fetch("/selfItemFlowQuery/search", {
         method: "POST",
         credentials: "same-origin",
@@ -182,30 +215,105 @@
           "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
           "X-Requested-With": "XMLHttpRequest",
         },
-        body: formParams(start, end, pageNo).toString(),
+        body: params.toString(),
       });
       if (!response.ok) throw new Error(`查询失败：HTTP ${response.status}`);
+      return parsePayload(await response.text());
+    } finally {
+      resetCaptcha();
+    }
+  }
 
-      const page = parsePayload(await response.text());
+  async function collectPages(request, shouldRetry = () => false) {
+    let summary;
+    let total = 0;
+    const records = [];
+    for (let pageNo = 1; ; pageNo += 1) {
+      let page;
+      for (;;) {
+        try {
+          page = await request(pageNo);
+          const expectedTotal = summary ? total : page.total;
+          if (summary && page.total !== total) throw new Error("查询明细分页总数异常");
+          if (records.length + page.records.length > expectedTotal) {
+            throw new Error("查询明细分页异常");
+          }
+          if (records.length > 0 && page.records.length === 0) {
+            throw new Error("查询明细分页不完整");
+          }
+          break;
+        } catch (error) {
+          if (!shouldRetry(error)) throw error;
+        }
+      }
       if (!summary) {
         summary = { spent: page.spent, income: page.income };
         total = page.total;
       }
       records.push(...page.records);
-      if (records.length > total) throw new Error("查询明细分页异常");
       if (records.length === total) break;
-      if (page.records.length === 0) throw new Error("查询明细分页不完整");
     }
     return { ...summary, records, total };
   }
 
-  async function runQuery(button, start, end) {
+  // ponytail: 等待或请求卡住时刷新页面；需要保留页面状态时再加无刷新取消。
+  function waitForClick(button, text) {
+    button.textContent = text;
+    button.disabled = false;
+    return new Promise((resolve) => {
+      button.addEventListener("click", () => {
+        button.disabled = true;
+        resolve();
+      }, { once: true });
+    });
+  }
+
+  async function waitForCaptcha(button, text, verification) {
+    let result = captchaResult(verification.consumed);
+    while (!result) {
+      await waitForClick(button, text);
+      result = captchaResult(verification.consumed);
+      if (!result) {
+        alert("[异环猫刊亭统计] 请先完成页面上的滑动验证");
+      }
+    }
+    verification.consumed = result.instance;
+    return result.secCode;
+  }
+
+  async function querySlice(button, start, end, index, count, verification) {
+    prepareRange(start, end);
+    formParams(start, end);
+    return collectPages(async (pageNo) => {
+      const step = `第 ${index}/${count} 段${pageNo > 1 ? ` · 第 ${pageNo} 页` : ""}`;
+      const secCode = await waitForCaptcha(
+        button,
+        `${step}：滑动后继续`,
+        verification,
+      );
+      button.textContent = `${step}：查询中`;
+      return requestPage(start, end, pageNo, secCode);
+    }, (error) => {
+      if (!confirm(
+        `[异环猫刊亭统计] ${error.message}\n\n重新完成滑动验证后重试当前请求？`,
+      )) throw new Error("查询已取消");
+      return true;
+    });
+  }
+
+  async function runQuery(button, start, end, verification) {
     const slices = splitRange(start, end);
     const total = { spent: 0, income: 0 };
     const records = [];
     for (let index = 0; index < slices.length; index += 1) {
-      button.textContent = `查询中 ${index + 1}/${slices.length}`;
-      const value = await querySlice(slices[index].start, slices[index].end);
+      const value = await querySlice(
+        button,
+        slices[index].start,
+        slices[index].end,
+        index + 1,
+        slices.length,
+        verification,
+      );
       if (value.records.length === 0) continue;
       total.spent += value.spent;
       total.income += value.income;
@@ -378,6 +486,7 @@
     dialog.querySelector("[data-close]").addEventListener("click", () => dialog.close());
 
     const buttons = [activityButton, todayButton];
+    const verification = { consumed: null };
     let running = false;
     async function execute(button, label, start, key) {
       if (running) return;
@@ -388,16 +497,22 @@
           Math.floor(Date.now() / 1000) * 1000 - END_TIME_GRACE,
         );
         const periodStart = start(periodEnd);
-        button.textContent = "查询中 1/1";
         const generatedAt = formatDate(periodEnd);
-        const value = await runQuery(button, periodStart, periodEnd);
+        const value = await runQuery(
+          button,
+          periodStart,
+          periodEnd,
+          verification,
+        );
         globalThis.yihuanActivityStats = {
           ...(globalThis.yihuanActivityStats || {}),
           [key]: { generatedAt, ...value },
         };
         showResult(label, value, generatedAt);
       } catch (error) {
-        alert(`[异环猫刊亭统计] ${error.message}`);
+        if (error.message !== "查询已取消") {
+          alert(`[异环猫刊亭统计] ${error.message}`);
+        }
       } finally {
         running = false;
         buttons.forEach((item) => { item.disabled = false; });
@@ -415,7 +530,7 @@
     document.body.append(dialog);
   }
 
-  function selfCheck() {
+  async function selfCheck() {
     const slices = splitRange(
       new Date("2026-07-02T00:00:00+08:00"),
       new Date("2026-07-22T00:00:00+08:00"),
@@ -442,6 +557,20 @@
       parsed.records,
       new Date("2026-07-05T23:59:59+08:00"),
     );
+    const requestedPages = [];
+    let pageTwoAttempts = 0;
+    const paged = await collectPages(async (pageNo) => {
+      requestedPages.push(pageNo);
+      if (pageNo === 2 && pageTwoAttempts++ === 0) return empty;
+      return pageNo === 1
+        ? { spent: 180000, income: 190000, total: 2, records: parsed.records.slice(0, 1) }
+        : { spent: 180000, income: 190000, total: 2, records: parsed.records.slice(1, 2) };
+    }, () => true);
+    let emptyRequests = 0;
+    await collectPages(async () => {
+      emptyRequests += 1;
+      return empty;
+    });
     if (
       slices.length !== 3
       || formatDate(slices[0].end) !== "2026-07-08 23:59:59"
@@ -474,6 +603,18 @@
     if (incompleteError?.message !== "查询明细分页不完整") {
       throw new Error("分页自检失败");
     }
+    if (requestedPages.join(",") !== "1,2,2" || paged.records.length !== 2) {
+      throw new Error("多页查询自检失败");
+    }
+    if (emptyRequests !== 1) throw new Error("空分页请求自检失败");
+    const captcha = {};
+    if (
+      freshCaptcha(captcha, "code", null)?.instance !== captcha
+      || freshCaptcha(captcha, "code", captcha) !== null
+      || freshCaptcha({}, "", captcha) !== null
+    ) {
+      throw new Error("滑动验证自检失败");
+    }
     if (
       formatDate(gameDayStart(new Date("2026-07-22T03:59:59+08:00"))) !== "2026-07-21 04:00:00"
       || formatDate(gameDayStart(new Date("2026-07-22T04:00:01+08:00"))) !== "2026-07-22 04:00:00"
@@ -486,6 +627,11 @@
     console.log("Self-check passed");
   }
 
-  if (typeof document === "undefined") selfCheck();
+  if (typeof document === "undefined") {
+    selfCheck().catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
+  }
   else installUi();
 })();
