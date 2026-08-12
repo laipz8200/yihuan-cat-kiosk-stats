@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         异环午夜猫刊亭统计
 // @namespace    https://kf.wanmei.com/
-// @version      1.3.2
+// @version      1.3.3
 // @description  在物品流向查询页分别查询活动累计或今日的消费、收入、盈亏和回报率
 // @match        https://kf.wanmei.com/selfItemFlowQuery*
 // @license      GPL-3.0-only
@@ -133,13 +133,15 @@
     const last = formatDate(end).slice(0, 10);
     const lastDate = new Date(`${last}T00:00:00Z`);
     const daily = [];
+    let cumulativeProfit = 0;
     for (
       let cursor = new Date(`${first}T00:00:00Z`);
       cursor <= lastDate;
       cursor = new Date(cursor.getTime() + DAY)
     ) {
       const date = cursor.toISOString().slice(0, 10);
-      daily.push({ date, profit: metrics(byDay.get(date) || { spent: 0, income: 0 }).profit });
+      cumulativeProfit += metrics(byDay.get(date) || { spent: 0, income: 0 }).profit;
+      daily.push({ date, profit: cumulativeProfit });
     }
     return { ...totals, daily };
   }
@@ -336,8 +338,8 @@
     const container = document.querySelector(`#${DIALOG_ID} [data-profit-chart]`);
     container.classList.toggle("empty", days.length === 0);
     if (days.length === 0) {
-      container.textContent = "暂无收益记录";
-      container.setAttribute("aria-label", "每日收益折线图：暂无记录");
+      container.textContent = "暂无盈亏记录";
+      container.setAttribute("aria-label", "累计盈亏折线图：暂无记录");
       return;
     }
 
@@ -371,7 +373,7 @@
     container.classList.remove("empty");
     container.setAttribute(
       "aria-label",
-      `每日收益折线图，${days[0].date} 至 ${days.at(-1).date}`,
+      `截至当日累计盈亏折线图，${days[0].date} 至 ${days.at(-1).date}，期末累计盈亏 ${number.format(days.at(-1).profit)}`,
     );
     container.innerHTML = `
       <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-hidden="true">
@@ -387,12 +389,12 @@
         />
         ${days.map((day, index) => `
           <circle cx="${x(index)}" cy="${y(day.profit)}" r="3.5" fill="#6f4cff">
-            <title>${day.date}：${number.format(day.profit)}</title>
+            <title>${day.date} 累计盈亏：${number.format(day.profit)}</title>
           </circle>
           <text x="${x(index)}" y="${plotBottom + 20}" text-anchor="middle" fill="#666" font-size="11">${day.date.slice(5)}</text>
         `).join("")}
         <text x="16" y="${(top + plotBottom) / 2}" text-anchor="middle" fill="#444" font-size="12"
-          transform="rotate(-90 16 ${(top + plotBottom) / 2})">收益</text>
+          transform="rotate(-90 16 ${(top + plotBottom) / 2})">累计盈亏</text>
         <text x="${left - 18}" y="${height - 10}" text-anchor="end" fill="#444" font-size="12">日期</text>
       </svg>
     `;
@@ -439,6 +441,7 @@
       }
       #${DIALOG_ID}::backdrop { background: #0008; }
       #${DIALOG_ID} h2 { margin: 0 40px 4px 0; font-size: 20px; }
+      #${DIALOG_ID} h3 { margin: 0 0 8px; font-size: 15px; }
       #${DIALOG_ID} p { margin: 0 0 16px; color: #666; }
       #${DIALOG_ID} [data-profit-chart] {
         width: 100%; min-height: 260px;
@@ -477,6 +480,7 @@
       <button type="button" data-close aria-label="关闭">×</button>
       <h2 id="${DIALOG_ID}-title">午夜猫刊亭统计</h2>
       <p data-generated-at></p>
+      <h3>截至当日累计盈亏</h3>
       <div data-profit-chart role="img"></div>
       <table>
         <thead><tr><th>范围</th><th>消费</th><th>收入</th><th>盈亏</th><th>结果</th><th>回报率</th></tr></thead>
@@ -595,9 +599,9 @@
       details.spent !== parsed.spent
       || details.income !== parsed.income
       || details.daily.map((day) => day.date).join(",") !== "2026-07-03,2026-07-04,2026-07-05"
-      || details.daily.map((day) => day.profit).join(",") !== "30000,0,-20000"
+      || details.daily.map((day) => day.profit).join(",") !== "30000,30000,10000"
     ) {
-      throw new Error("每日收益自检失败");
+      throw new Error("累计盈亏自检失败");
     }
     if (rejectedError?.message !== "测试错误") throw new Error("错误响应自检失败");
     if (incompleteError?.message !== "查询明细分页不完整") {
