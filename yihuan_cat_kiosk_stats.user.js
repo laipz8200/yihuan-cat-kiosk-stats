@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         异环午夜猫刊亭统计
 // @namespace    https://kf.wanmei.com/
-// @version      1.3.3
+// @version      1.3.4
 // @description  在物品流向查询页分别查询活动累计或今日的消费、收入、盈亏和回报率
 // @match        https://kf.wanmei.com/selfItemFlowQuery*
 // @license      GPL-3.0-only
@@ -24,6 +24,12 @@
   const SERVER_OFFSET = 8 * 60 * 60 * 1000;
   const ACTIONS_ID = "yihuan-cat-kiosk-stats-actions";
   const DIALOG_ID = "yihuan-cat-kiosk-stats-dialog";
+  const NO_RECORDS_MESSAGE = "暂时没有搜索到对应的记录";
+  const NUMBER_FORMAT = new Intl.NumberFormat("zh-CN");
+  const COMPACT_NUMBER_FORMAT = new Intl.NumberFormat("zh-CN", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  });
   // 查询明细不含单次消费额，按游戏内当前售价换算；汇总后会与接口总额校验。
   const CARD_PRICES = new Map([
     ["《荧幕之外》", 10000],
@@ -44,7 +50,7 @@
     const serverNow = new Date(now.getTime() + SERVER_OFFSET);
     const start = new Date(serverNow);
     start.setUTCHours(4, 0, 0, 0);
-    if (start >= serverNow) start.setUTCDate(start.getUTCDate() - 1);
+    if (start > serverNow) start.setUTCDate(start.getUTCDate() - 1);
     return new Date(start.getTime() - SERVER_OFFSET);
   }
 
@@ -70,6 +76,10 @@
     return { spent: Number(match[1]), income: Number(match[2]) };
   }
 
+  function emptyPage() {
+    return { spent: 0, income: 0, records: [], total: 0 };
+  }
+
   function parsePayload(raw) {
     const text = typeof raw === "string"
       ? raw.replace(/<pre[^>]*>/gi, "").replace(/<\/pre>/gi, "").trim()
@@ -81,16 +91,19 @@
       throw new Error("查询返回异常，登录可能已经失效");
     }
     if (!payload) throw new Error("查询没有返回结果，请稍后重试");
-    if (String(payload.code) === "1") throw new Error(payload.message || "查询失败");
+    if (String(payload.code) === "1") {
+      if (String(payload.message || "").startsWith(NO_RECORDS_MESSAGE)) return emptyPage();
+      throw new Error(payload.message || "查询失败");
+    }
     const records = payload?.data?.result;
     if (!Array.isArray(records)) throw new Error("查询返回缺少活动明细");
-    const total = Number(payload.data.total ?? records.length);
+    const total = Number(payload.data.total ?? (records.length === 0 ? 0 : NaN));
     if (!Number.isInteger(total) || total < records.length) {
       throw new Error("查询返回的记录总数异常");
     }
     if (records.length === 0) {
       if (total !== 0) throw new Error("查询明细分页不完整");
-      return { spent: 0, income: 0, records, total };
+      return emptyPage();
     }
     return { ...parseInfo(payload.data.info), records, total };
   }
@@ -146,17 +159,21 @@
     return { ...totals, daily };
   }
 
-  function formParams(start, end, pageNo = 1) {
+  function requireQueryForm() {
     const form = document.querySelector("#selfItemFlowQueryForm");
     if (!form) throw new Error("请先登录并进入异环物品流向自助查询页面");
     if (!document.querySelector("#prolink")?.checked) {
       throw new Error("请先勾选《完美世界游戏用户自助服务规则》");
     }
-
-    const params = new URLSearchParams(new FormData(form));
-    if (!params.get("roleId") || params.get("roleId") === "0") {
+    const roleId = form.querySelector('[name="roleId"]')?.value;
+    if (!roleId || roleId === "0") {
       throw new Error("请先在页面选择角色");
     }
+    return form;
+  }
+
+  function formParams(start, end, pageNo = 1) {
+    const params = new URLSearchParams(new FormData(requireQueryForm()));
 
     for (const name of ["item1", "item2", "item3", "item4", "item8", "item11"]) {
       params.delete(name);
@@ -285,7 +302,7 @@
 
   async function querySlice(button, start, end, index, count, verification) {
     prepareRange(start, end);
-    formParams(start, end);
+    requireQueryForm();
     return collectPages(async (pageNo) => {
       const step = `第 ${index}/${count} 段${pageNo > 1 ? ` · 第 ${pageNo} 页` : ""}`;
       const secCode = await waitForCaptcha(
@@ -334,15 +351,7 @@
     row.append(cell);
   }
 
-  function renderProfitChart(days) {
-    const container = document.querySelector(`#${DIALOG_ID} [data-profit-chart]`);
-    container.classList.toggle("empty", days.length === 0);
-    if (days.length === 0) {
-      container.textContent = "暂无盈亏记录";
-      container.setAttribute("aria-label", "累计盈亏折线图：暂无记录");
-      return;
-    }
-
+  function profitChartLayout(days) {
     const viewportWidth = 700;
     const height = 260;
     const left = 72;
@@ -359,27 +368,42 @@
       min -= 1;
       max += 1;
     }
-    const x = (index) => left + (days.length === 1
-      ? plotWidth / 2
-      : (index * plotWidth) / (days.length - 1));
-    const y = (value) => top + ((max - value) / (max - min)) * (plotBottom - top);
-    const ticks = [max, (max + min) / 2, min];
-    const compact = new Intl.NumberFormat("zh-CN", {
-      notation: "compact",
-      maximumFractionDigits: 1,
-    });
-    const number = new Intl.NumberFormat("zh-CN");
+    return {
+      width,
+      height,
+      left,
+      right,
+      top,
+      plotBottom,
+      ticks: [max, (max + min) / 2, min],
+      x: (index) => left + (days.length === 1
+        ? plotWidth / 2
+        : (index * plotWidth) / (days.length - 1)),
+      y: (value) => top + ((max - value) / (max - min)) * (plotBottom - top),
+    };
+  }
 
-    container.classList.remove("empty");
+  function renderProfitChart(days) {
+    const container = document.querySelector(`#${DIALOG_ID} [data-profit-chart]`);
+    container.classList.toggle("empty", days.length === 0);
+    if (days.length === 0) {
+      container.textContent = "暂无盈亏记录";
+      container.setAttribute("aria-label", "累计盈亏折线图：暂无记录");
+      return;
+    }
+
+    const { width, height, left, right, top, plotBottom, ticks, x, y } =
+      profitChartLayout(days);
+
     container.setAttribute(
       "aria-label",
-      `截至当日累计盈亏折线图，${days[0].date} 至 ${days.at(-1).date}，期末累计盈亏 ${number.format(days.at(-1).profit)}`,
+      `截至当日累计盈亏折线图，${days[0].date} 至 ${days.at(-1).date}，期末累计盈亏 ${NUMBER_FORMAT.format(days.at(-1).profit)}`,
     );
     container.innerHTML = `
       <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" aria-hidden="true">
         ${ticks.map((tick) => `
           <line x1="${left}" y1="${y(tick)}" x2="${width - right}" y2="${y(tick)}" stroke="#e7e7e7" />
-          <text x="${left - 10}" y="${y(tick) + 4}" text-anchor="end" fill="#666" font-size="11">${compact.format(tick)}</text>
+          <text x="${left - 10}" y="${y(tick) + 4}" text-anchor="end" fill="#666" font-size="11">${COMPACT_NUMBER_FORMAT.format(tick)}</text>
         `).join("")}
         <line x1="${left}" y1="${top}" x2="${left}" y2="${plotBottom}" stroke="#999" />
         <line x1="${left}" y1="${y(0)}" x2="${width - right}" y2="${y(0)}" stroke="#aaa" stroke-dasharray="4 4" />
@@ -389,7 +413,7 @@
         />
         ${days.map((day, index) => `
           <circle cx="${x(index)}" cy="${y(day.profit)}" r="3.5" fill="#6f4cff">
-            <title>${day.date} 累计盈亏：${number.format(day.profit)}</title>
+            <title>${day.date} 累计盈亏：${NUMBER_FORMAT.format(day.profit)}</title>
           </circle>
           <text x="${x(index)}" y="${plotBottom + 20}" text-anchor="middle" fill="#666" font-size="11">${day.date.slice(5)}</text>
         `).join("")}
@@ -403,14 +427,13 @@
   function showResult(label, value, generatedAt) {
     const dialog = document.querySelector(`#${DIALOG_ID}`);
     const body = dialog.querySelector("tbody");
-    const number = new Intl.NumberFormat("zh-CN");
     body.replaceChildren();
 
     const row = document.createElement("tr");
     addCell(row, label);
-    addCell(row, number.format(value.spent));
-    addCell(row, number.format(value.income));
-    addCell(row, number.format(value.profit));
+    addCell(row, NUMBER_FORMAT.format(value.spent));
+    addCell(row, NUMBER_FORMAT.format(value.income));
+    addCell(row, NUMBER_FORMAT.format(value.profit));
     addCell(row, value.profit > 0 ? "盈利" : value.profit < 0 ? "亏损" : "持平");
     addCell(row, value.returnRate === null ? "—" : `${value.returnRate.toFixed(2)}%`);
     body.append(row);
@@ -535,6 +558,19 @@
   }
 
   async function selfCheck() {
+    function check(condition, message) {
+      if (!condition) throw new Error(message);
+    }
+
+    function errorMessage(callback) {
+      try {
+        callback();
+      } catch (error) {
+        return error.message;
+      }
+      return null;
+    }
+
     const slices = splitRange(
       new Date("2026-07-02T00:00:00+08:00"),
       new Date("2026-07-22T00:00:00+08:00"),
@@ -545,18 +581,15 @@
     const empty = parsePayload(
       '{"code":0,"data":{"result":[],"info":"暂时没有搜索到对应的信息"}}',
     );
-    let rejectedError;
-    let incompleteError;
-    try {
-      parsePayload('{"code":"1","message":"测试错误"}');
-    } catch (error) {
-      rejectedError = error;
-    }
-    try {
-      parsePayload('{"code":0,"data":{"total":1,"result":[]}}');
-    } catch (error) {
-      incompleteError = error;
-    }
+    const messageEmpty = parsePayload(
+      '{"code":1,"message":"暂时没有搜索到对应的记录，请精确您的信息"}',
+    );
+    const rejectedMessage = errorMessage(() =>
+      parsePayload('{"code":"1","message":"测试错误"}'));
+    const incompleteMessage = errorMessage(() =>
+      parsePayload('{"code":0,"data":{"total":1,"result":[]}}'));
+    const missingTotalMessage = errorMessage(() =>
+      parsePayload('{"code":0,"data":{"result":[{}],"info":"测试"}}'));
     const details = aggregateRecords(
       parsed.records,
       new Date("2026-07-05T23:59:59+08:00"),
@@ -573,61 +606,72 @@
     let emptyRequests = 0;
     await collectPages(async () => {
       emptyRequests += 1;
-      return empty;
+      return messageEmpty;
     });
-    if (
-      slices.length !== 3
-      || formatDate(slices[0].end) !== "2026-07-08 23:59:59"
-      || formatDate(slices[1].start) !== "2026-07-09 00:00:00"
-    ) {
-      throw new Error("分片自检失败");
-    }
-    if (slices[0].end.getTime() + 1000 !== slices[1].start.getTime()) {
-      throw new Error("分片边界自检失败");
-    }
-    if (
-      parsed.spent !== 180000
-      || parsed.total !== 5
-      || metrics(parsed).profit !== 10000
-    ) {
-      throw new Error("汇总自检失败");
-    }
-    if (empty.spent !== 0 || empty.income !== 0 || empty.records.length !== 0) {
-      throw new Error("空区间自检失败");
-    }
-    if (
-      details.spent !== parsed.spent
-      || details.income !== parsed.income
-      || details.daily.map((day) => day.date).join(",") !== "2026-07-03,2026-07-04,2026-07-05"
-      || details.daily.map((day) => day.profit).join(",") !== "30000,30000,10000"
-    ) {
-      throw new Error("累计盈亏自检失败");
-    }
-    if (rejectedError?.message !== "测试错误") throw new Error("错误响应自检失败");
-    if (incompleteError?.message !== "查询明细分页不完整") {
-      throw new Error("分页自检失败");
-    }
-    if (requestedPages.join(",") !== "1,2,2" || paged.records.length !== 2) {
-      throw new Error("多页查询自检失败");
-    }
-    if (emptyRequests !== 1) throw new Error("空分页请求自检失败");
+    const singlePointChart = profitChartLayout([{ profit: 0 }]);
+    const scrollableChart = profitChartLayout(
+      Array.from({ length: 12 }, () => ({ profit: 0 })),
+    );
+
+    check(
+      slices.length === 3
+      && formatDate(slices[0].end) === "2026-07-08 23:59:59"
+      && formatDate(slices[1].start) === "2026-07-09 00:00:00",
+      "分片自检失败",
+    );
+    check(
+      slices[0].end.getTime() + 1000 === slices[1].start.getTime(),
+      "分片边界自检失败",
+    );
+    check(
+      parsed.spent === 180000
+      && parsed.total === 5
+      && metrics(parsed).profit === 10000,
+      "汇总自检失败",
+    );
+    check(
+      [empty, messageEmpty].every((value) =>
+        value.spent === 0 && value.income === 0 && value.records.length === 0),
+      "空区间自检失败",
+    );
+    check(
+      details.spent === parsed.spent
+      && details.income === parsed.income
+      && details.daily.map((day) => day.date).join(",") === "2026-07-03,2026-07-04,2026-07-05"
+      && details.daily.map((day) => day.profit).join(",") === "30000,30000,10000",
+      "累计盈亏自检失败",
+    );
+    check(rejectedMessage === "测试错误", "错误响应自检失败");
+    check(incompleteMessage === "查询明细分页不完整", "分页自检失败");
+    check(missingTotalMessage === "查询返回的记录总数异常", "分页总数自检失败");
+    check(
+      requestedPages.join(",") === "1,2,2" && paged.records.length === 2,
+      "多页查询自检失败",
+    );
+    check(emptyRequests === 1, "空分页请求自检失败");
     const captcha = {};
-    if (
-      freshCaptcha(captcha, "code", null)?.instance !== captcha
-      || freshCaptcha(captcha, "code", captcha) !== null
-      || freshCaptcha({}, "", captcha) !== null
-    ) {
-      throw new Error("滑动验证自检失败");
-    }
-    if (
-      formatDate(gameDayStart(new Date("2026-07-22T03:59:59+08:00"))) !== "2026-07-21 04:00:00"
-      || formatDate(gameDayStart(new Date("2026-07-22T04:00:01+08:00"))) !== "2026-07-22 04:00:00"
-    ) {
-      throw new Error("今日起点自检失败");
-    }
-    if (formatDate(new Date("2026-07-21T16:49:00Z")) !== "2026-07-22 00:49:00") {
-      throw new Error("时间格式自检失败");
-    }
+    check(
+      freshCaptcha(captcha, "code", null)?.instance === captcha
+      && freshCaptcha(captcha, "code", captcha) === null
+      && freshCaptcha({}, "", captcha) === null,
+      "滑动验证自检失败",
+    );
+    check(
+      formatDate(gameDayStart(new Date("2026-07-22T03:59:59+08:00"))) === "2026-07-21 04:00:00"
+      && formatDate(gameDayStart(new Date("2026-07-22T04:00:00+08:00"))) === "2026-07-22 04:00:00",
+      "今日起点自检失败",
+    );
+    check(
+      formatDate(new Date("2026-07-21T16:49:00Z")) === "2026-07-22 00:49:00",
+      "时间格式自检失败",
+    );
+    check(
+      singlePointChart.width === 700
+      && Number.isFinite(singlePointChart.x(0))
+      && Number.isFinite(singlePointChart.y(0)),
+      "图表布局自检失败",
+    );
+    check(scrollableChart.width > 700, "图表滚动自检失败");
     console.log("Self-check passed");
   }
 
