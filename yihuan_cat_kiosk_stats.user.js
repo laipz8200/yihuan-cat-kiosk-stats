@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         异环午夜猫刊亭统计
 // @namespace    https://kf.wanmei.com/
-// @version      1.3.4
+// @version      1.3.5
 // @description  在物品流向查询页分别查询活动累计或今日的消费、收入、盈亏和回报率
 // @match        https://kf.wanmei.com/selfItemFlowQuery*
 // @license      GPL-3.0-only
@@ -37,6 +37,9 @@
     ["《猫会梦见什么》", 50000],
     ["《拉面的艺术》", 50000],
     ["《在书本之外》", 50000],
+    ["《纸上游鱼》", 10000],
+    ["《纸寄长情》", 50000],
+    ["《书中春生》", 30000],
   ]);
 
   function formatDate(date) {
@@ -576,7 +579,7 @@
       new Date("2026-07-22T00:00:00+08:00"),
     );
     const parsed = parsePayload(
-      '<pre>{"code":0,"data":{"total":5,"result":[{"logTime":"2026-07-03 12:00","scratchCardId":"《荧幕之外》","award":"方斯*40000"},{"logTime":"2026-07-03 12:01","scratchCardId":"《拉面的艺术》","award":"方斯*50000"},{"logTime":"2026-07-03 12:02","scratchCardId":"《在书本之外》","award":"方斯*50000"},{"logTime":"2026-07-04 12:00","scratchCardId":"《猫会梦见什么》","award":"方斯*50000"},{"logTime":"2026-07-05 12:00","scratchCardId":"《海特洛快讯》","award":""}],"info":"共计消耗180000方斯购买好感度道具，获得奖券奖励190000方斯"}}</pre>',
+      '<pre>{"code":0,"data":{"total":8,"result":[{"logTime":"2026-07-03 12:00","scratchCardId":"《荧幕之外》","award":"方斯*40000"},{"logTime":"2026-07-03 12:01","scratchCardId":"《拉面的艺术》","award":"方斯*50000"},{"logTime":"2026-07-03 12:02","scratchCardId":"《在书本之外》","award":"方斯*50000"},{"logTime":"2026-07-03 12:03","scratchCardId":"《纸上游鱼》","award":"方斯*10000"},{"logTime":"2026-07-04 12:00","scratchCardId":"《猫会梦见什么》","award":"方斯*50000"},{"logTime":"2026-07-04 12:01","scratchCardId":"《纸寄长情》","award":"方斯*50000"},{"logTime":"2026-07-05 12:00","scratchCardId":"《海特洛快讯》","award":""},{"logTime":"2026-07-05 12:01","scratchCardId":"《书中春生》","award":"方斯*30000"}],"info":"共计消耗270000方斯购买好感度道具，获得奖券奖励280000方斯"}}</pre>',
     );
     const empty = parsePayload(
       '{"code":0,"data":{"result":[],"info":"暂时没有搜索到对应的信息"}}',
@@ -624,8 +627,8 @@
       "分片边界自检失败",
     );
     check(
-      parsed.spent === 180000
-      && parsed.total === 5
+      parsed.spent === 270000
+      && parsed.total === 8
       && metrics(parsed).profit === 10000,
       "汇总自检失败",
     );
